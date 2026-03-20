@@ -1,9 +1,14 @@
 import os
 import logging
 from typing import List, Dict, Any, Optional
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, UploadFile, File
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
+import io
+import PyPDF2
+from langchain_text_splitters import RecursiveCharacterTextSplitter
+from langchain_community.embeddings import HuggingFaceEmbeddings
+from langchain_community.vectorstores import FAISS
 from dotenv import load_dotenv
 from huggingface_hub import InferenceClient
 
@@ -15,8 +20,6 @@ logger = logging.getLogger(__name__)
 load_dotenv("../.env.local")
 
 # Get HF API Key
-# Note: In Vite, env variables prefix with VITE_. We'll just read that for convenience,
-# but in a real production app you'd just have standard env variables for the backend.
 HF_API_KEY = os.getenv("VITE_HF_API_KEY")
 
 if not HF_API_KEY:
@@ -32,6 +35,10 @@ except Exception as e:
 
 # Initialize FastAPI app
 app = FastAPI(title="Lumina AI Backend")
+
+# Initialize RAG components
+vector_store = None
+embeddings = HuggingFaceEmbeddings(model_name="all-MiniLM-L6-v2")
 
 # Define CORS to allow requests from the React frontend running on Vite
 app.add_middleware(
@@ -58,6 +65,40 @@ async def health_check():
     """Simple health check endpoint."""
     return {"status": "ok", "message": "Backend is running"}
 
+@app.post("/api/upload")
+async def upload_pdf(file: UploadFile = File(...)):
+    global vector_store
+    
+    if not file.filename.endswith(".pdf"):
+        raise HTTPException(status_code=400, detail="Only PDF files are supported.")
+        
+    try:
+        # Read PDF
+        content = await file.read()
+        pdf_reader = PyPDF2.PdfReader(io.BytesIO(content))
+        
+        text = ""
+        for page in pdf_reader.pages:
+            page_text = page.extract_text()
+            if page_text:
+                text += page_text + "\n"
+                
+        if not text.strip():
+            raise HTTPException(status_code=400, detail="Could not extract text from PDF.")
+            
+        # Chunk the text
+        text_splitter = RecursiveCharacterTextSplitter(chunk_size=1000, chunk_overlap=200)
+        chunks = text_splitter.split_text(text)
+        
+        # Create FAISS vector store
+        vector_store = FAISS.from_texts(chunks, embeddings)
+        
+        return {"status": "success", "message": f"Successfully processed {len(chunks)} chunks from the PDF."}
+        
+    except Exception as e:
+        logger.error(f"Error processing PDF: {str(e)}")
+        raise HTTPException(status_code=500, detail=f"Error processing PDF: {str(e)}")
+
 @app.post("/api/chat")
 async def chat_completion(request: ChatRequest):
     """
@@ -69,6 +110,19 @@ async def chat_completion(request: ChatRequest):
     try:
         # Build messages for the API
         system_prompt = "You are a helpful, friendly website assistant. Keep responses concise and professional. Use markdown for formatting when appropriate."
+        
+        # Add RAG context if available
+        if vector_store and request.messages:
+            # Find the latest user message
+            latest_user_msg = next((msg.content for msg in reversed(request.messages) if msg.role == "user"), None)
+            
+            if latest_user_msg:
+                # Retrieve relevant chunks
+                docs = vector_store.similarity_search(latest_user_msg, k=3)
+                context = "\n\n".join([doc.page_content for doc in docs])
+                
+                if context:
+                    system_prompt += f"\n\nUse the following context from an uploaded document to answer the user's question. If the answer is not in the context, use your general knowledge but mention that it's not in the document.\n\nContext:\n{context}"
         
         # Format conversation history
         api_messages = [{"role": "system", "content": system_prompt}]
